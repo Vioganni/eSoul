@@ -282,184 +282,183 @@ class OxfordScheduler:
 
                 return treatment_schedule
 
-        # ← THIS NEEDS TO BE INDENTED INSIDE THE CLASS
         def schedule_inspections(self, year, month, group, treatment_schedule):
-        inspection_targets = self.houses[group]
-        inspectors = [h for h in self.all_houses if h not in inspection_targets]
-        available_dates = self.get_inspection_dates(year, month)
-
-        commitment_dates_by_house = defaultdict(list)
-        for loc_name, info in treatment_schedule.items():
-                for house in info['houses']:
-                        commitment_dates_by_house[house].append(info['date'])
-
-        inspection_schedule, violations = {}, []
-        used_dates = set()
-        inspector_usage = defaultdict(int)
-        used_inspectors_per_date = defaultdict(set)
-        inspector_used_dates = defaultdict(set)
-
-        # RULE: Max 2 inspections per inspector per month (fair distribution)
-        MAX_INSPECTIONS_PER_INSPECTOR = 2
-
-        # RULE: Minimum 4 days between inspections for the SAME inspector
-        MIN_DAYS_BETWEEN = self.rules['week_buffer_days']
-
-        # RULE: 3 months between same inspector inspecting same target
-        INSPECTION_REPEAT_MONTHS = self.rules['inspection_repeat_months']
-
-        # Sort targets by priority (those with longest wait since last inspection)
-        targets_with_priority = []
-        for target in inspection_targets:
-                # Find when this target was last inspected by ANYONE
-                last_inspection = None
-                for inspector in inspectors:
-                        if inspector in self.inspection_history and target in self.inspection_history[inspector]:
-                                last = max(self.inspection_history[inspector][target])
-                                if last_inspection is None or last > last_inspection:
-                                        last_inspection = last
-
-                if last_inspection:
-                        days_since = (datetime(year, month, 1) - last_inspection).days
-                else:
-                        days_since = 99999  # Never inspected - highest priority
-
-                targets_with_priority.append((target, days_since))
-
-        # Sort by longest wait first (most in need)
-        targets_with_priority.sort(key=lambda x: x[1], reverse=True)
-        sorted_targets = [t[0] for t in targets_with_priority]
-
-        for target in sorted_targets:
-                best_pair = None
-                best_date = None
-                best_score = float('inf')
-
-                # Try each available date
-                for date in available_dates:
-                        # RULE: Check week_buffer_days between inspection dates
-                        if date in used_dates:
-                                continue
-
-                        # Check if any inspector already has an inspection too close
-                        too_close = False
+                inspection_targets = self.houses[group]
+                inspectors = [h for h in self.all_houses if h not in inspection_targets]
+                available_dates = self.get_inspection_dates(year, month)
+        
+                commitment_dates_by_house = defaultdict(list)
+                for loc_name, info in treatment_schedule.items():
+                        for house in info['houses']:
+                                commitment_dates_by_house[house].append(info['date'])
+        
+                inspection_schedule, violations = {}, []
+                used_dates = set()
+                inspector_usage = defaultdict(int)
+                used_inspectors_per_date = defaultdict(set)
+                inspector_used_dates = defaultdict(set)
+        
+                # RULE: Max 2 inspections per inspector per month (fair distribution)
+                MAX_INSPECTIONS_PER_INSPECTOR = 2
+        
+                # RULE: Minimum 4 days between inspections for the SAME inspector
+                MIN_DAYS_BETWEEN = self.rules['week_buffer_days']
+        
+                # RULE: 3 months between same inspector inspecting same target
+                INSPECTION_REPEAT_MONTHS = self.rules['inspection_repeat_months']
+        
+                # Sort targets by priority (those with longest wait since last inspection)
+                targets_with_priority = []
+                for target in inspection_targets:
+                        # Find when this target was last inspected by ANYONE
+                        last_inspection = None
                         for inspector in inspectors:
-                                for used_date in inspector_used_dates[inspector]:
-                                        if abs((date - used_date).days) < MIN_DAYS_BETWEEN:
-                                                too_close = True
-                                                break
-                                if too_close:
-                                        break
-                        if too_close:
-                                continue
-
-                        # Find eligible inspectors for this date
-                        eligible = []
-                        for inspector in inspectors:
-                                # RULE: Max inspections per inspector
-                                if inspector_usage[inspector] >= MAX_INSPECTIONS_PER_INSPECTOR:
-                                        continue
-
-                                # Can't inspect twice on same day
-                                if date in used_inspectors_per_date[date]:
-                                        continue
-
-                                # Can't inspect if they have a treatment commitment
-                                if any(abs((date - td).days) == 0 for td in commitment_dates_by_house[inspector]):
-                                        continue
-
-                                # RULE: 3 months between same inspector-target pair
                                 if inspector in self.inspection_history and target in self.inspection_history[inspector]:
                                         last = max(self.inspection_history[inspector][target])
-                                        months_since = (date.year - last.year) * 12 + (date.month - last.month)
-                                        if months_since < INSPECTION_REPEAT_MONTHS:
-                                                continue
-
-                                # Calculate score: lower usage = better
-                                score = inspector_usage[inspector]
-                                eligible.append((inspector, score))
-
-                        # Sort by usage (lowest first)
-                        eligible.sort(key=lambda x: x[1])
-
-                        # Try to pair inspectors
-                        for i in range(len(eligible)):
-                                for j in range(i+1, len(eligible)):
-                                        inspector_a = eligible[i][0]
-                                        inspector_b = eligible[j][0]
-
-                                        # Check if these two inspectors can work together
-                                        # Don't pair if both have commitments on same day
-                                        has_a_commit = any(abs((date - td).days) < 2 for td in commitment_dates_by_house[inspector_a])
-                                        has_b_commit = any(abs((date - td).days) < 2 for td in commitment_dates_by_house[inspector_b])
-
-                                        if has_a_commit and has_b_commit:
-                                                continue
-
-                                        total_score = eligible[i][1] + eligible[j][1]
-                                        if total_score < best_score:
-                                                best_score = total_score
-                                                best_pair = (inspector_a, inspector_b)
-                                                best_date = date
-
-                if best_pair:
-                        inspection_schedule[target] = {
-                                'date': best_date,
-                                'inspectors': list(best_pair)
-                        }
-
-                        for insp in best_pair:
-                                inspector_usage[insp] += 1
-                                used_inspectors_per_date[best_date].add(insp)
-                                inspector_used_dates[insp].add(best_date)
-
-                        used_dates.add(best_date)
-                else:
-                        # Fallback: schedule anyway but mark as violation
-                        violations.append(f"Could not properly schedule inspectors for {target}")
-
-                        # Find any available date
-                        fallback_date = None
-                        for d in available_dates:
-                                if d not in used_dates:
-                                        fallback_date = d
-                                        break
-                        if not fallback_date:
-                                fallback_date = available_dates[0]
-
-                        # Find any available inspectors
-                        fallback_inspectors = []
-                        for insp in inspectors:
-                                if insp not in used_inspectors_per_date[fallback_date]:
-                                        if inspector_usage[insp] < MAX_INSPECTIONS_PER_INSPECTOR:
-                                                fallback_inspectors.append(insp)
-                                                if len(fallback_inspectors) >= 2:
+                                        if last_inspection is None or last > last_inspection:
+                                                last_inspection = last
+        
+                        if last_inspection:
+                                days_since = (datetime(year, month, 1) - last_inspection).days
+                        else:
+                                days_since = 99999  # Never inspected - highest priority
+        
+                        targets_with_priority.append((target, days_since))
+        
+                # Sort by longest wait first (most in need)
+                targets_with_priority.sort(key=lambda x: x[1], reverse=True)
+                sorted_targets = [t[0] for t in targets_with_priority]
+        
+                for target in sorted_targets:
+                        best_pair = None
+                        best_date = None
+                        best_score = float('inf')
+        
+                        # Try each available date
+                        for date in available_dates:
+                                # RULE: Check week_buffer_days between inspection dates
+                                if date in used_dates:
+                                        continue
+        
+                                # Check if any inspector already has an inspection too close
+                                too_close = False
+                                for inspector in inspectors:
+                                        for used_date in inspector_used_dates[inspector]:
+                                                if abs((date - used_date).days) < MIN_DAYS_BETWEEN:
+                                                        too_close = True
                                                         break
-
-                        if len(fallback_inspectors) < 2:
-                                # Last resort: use any inspectors
+                                        if too_close:
+                                                break
+                                if too_close:
+                                        continue
+        
+                                # Find eligible inspectors for this date
+                                eligible = []
+                                for inspector in inspectors:
+                                        # RULE: Max inspections per inspector
+                                        if inspector_usage[inspector] >= MAX_INSPECTIONS_PER_INSPECTOR:
+                                                continue
+        
+                                        # Can't inspect twice on same day
+                                        if date in used_inspectors_per_date[date]:
+                                                continue
+        
+                                        # Can't inspect if they have a treatment commitment
+                                        if any(abs((date - td).days) == 0 for td in commitment_dates_by_house[inspector]):
+                                                continue
+        
+                                        # RULE: 3 months between same inspector-target pair
+                                        if inspector in self.inspection_history and target in self.inspection_history[inspector]:
+                                                last = max(self.inspection_history[inspector][target])
+                                                months_since = (date.year - last.year) * 12 + (date.month - last.month)
+                                                if months_since < INSPECTION_REPEAT_MONTHS:
+                                                        continue
+        
+                                        # Calculate score: lower usage = better
+                                        score = inspector_usage[inspector]
+                                        eligible.append((inspector, score))
+        
+                                # Sort by usage (lowest first)
+                                eligible.sort(key=lambda x: x[1])
+        
+                                # Try to pair inspectors
+                                for i in range(len(eligible)):
+                                        for j in range(i+1, len(eligible)):
+                                                inspector_a = eligible[i][0]
+                                                inspector_b = eligible[j][0]
+        
+                                                # Check if these two inspectors can work together
+                                                # Don't pair if both have commitments on same day
+                                                has_a_commit = any(abs((date - td).days) < 2 for td in commitment_dates_by_house[inspector_a])
+                                                has_b_commit = any(abs((date - td).days) < 2 for td in commitment_dates_by_house[inspector_b])
+        
+                                                if has_a_commit and has_b_commit:
+                                                        continue
+        
+                                                total_score = eligible[i][1] + eligible[j][1]
+                                                if total_score < best_score:
+                                                        best_score = total_score
+                                                        best_pair = (inspector_a, inspector_b)
+                                                        best_date = date
+        
+                        if best_pair:
+                                inspection_schedule[target] = {
+                                        'date': best_date,
+                                        'inspectors': list(best_pair)
+                                }
+        
+                                for insp in best_pair:
+                                        inspector_usage[insp] += 1
+                                        used_inspectors_per_date[best_date].add(insp)
+                                        inspector_used_dates[insp].add(best_date)
+        
+                                used_dates.add(best_date)
+                        else:
+                                # Fallback: schedule anyway but mark as violation
+                                violations.append(f"Could not properly schedule inspectors for {target}")
+        
+                                # Find any available date
+                                fallback_date = None
+                                for d in available_dates:
+                                        if d not in used_dates:
+                                                fallback_date = d
+                                                break
+                                if not fallback_date:
+                                        fallback_date = available_dates[0]
+        
+                                # Find any available inspectors
+                                fallback_inspectors = []
                                 for insp in inspectors:
                                         if insp not in used_inspectors_per_date[fallback_date]:
-                                                fallback_inspectors.append(insp)
-                                                if len(fallback_inspectors) >= 2:
-                                                        break
+                                                if inspector_usage[insp] < MAX_INSPECTIONS_PER_INSPECTOR:
+                                                        fallback_inspectors.append(insp)
+                                                        if len(fallback_inspectors) >= 2:
+                                                                break
+        
                                 if len(fallback_inspectors) < 2:
-                                        fallback_inspectors = inspectors[:2]
-
-                        inspection_schedule[target] = {
-                                'date': fallback_date,
-                                'inspectors': fallback_inspectors,
-                                'violation': True
-                        }
-
-                        for insp in fallback_inspectors:
-                                inspector_usage[insp] += 1
-                                used_inspectors_per_date[fallback_date].add(insp)
-                                inspector_used_dates[insp].add(fallback_date)
-
-                        used_dates.add(fallback_date)
-
-        return inspection_schedule, violations
+                                        # Last resort: use any inspectors
+                                        for insp in inspectors:
+                                                if insp not in used_inspectors_per_date[fallback_date]:
+                                                        fallback_inspectors.append(insp)
+                                                        if len(fallback_inspectors) >= 2:
+                                                                break
+                                        if len(fallback_inspectors) < 2:
+                                                fallback_inspectors = inspectors[:2]
+        
+                                inspection_schedule[target] = {
+                                        'date': fallback_date,
+                                        'inspectors': fallback_inspectors,
+                                        'violation': True
+                                }
+        
+                                for insp in fallback_inspectors:
+                                        inspector_usage[insp] += 1
+                                        used_inspectors_per_date[fallback_date].add(insp)
+                                        inspector_used_dates[insp].add(fallback_date)
+        
+                                used_dates.add(fallback_date)
+        
+                return inspection_schedule, violations
 
         def generate_schedule(self, year, month, overwrite=False, auto_save=True):
                 group = 'A' if month % 2 == 1 else 'B'
