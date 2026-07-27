@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+import json
+import os
+import shutil
+from datetime import datetime, timedelta
+from typing import List, Dict, Set, Tuple, Optional
+import calendar
+from collections import defaultdict
+import logging
+from PIL import Image, ImageDraw, ImageFont
+
+try:
+        from config import HOUSES, TREATMENT_LOCATIONS, RULES
+except ImportError:
+        HOUSES = None
+        TREATMENT_LOCATIONS = None
+        RULES = None
+
+class OxfordScheduler:
+        def __init__(self, history_file: str = 'history.json', backup_dir: str = 'backups'):
+                self.history_file = history_file
+                self.backup_dir = backup_dir
+
+                logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+                self.logger = logging.getLogger(__name__)
+
+                self.assets_path = "assets"
+                self.images_path = os.path.join(self.assets_path, "images")
+                self.template_path = os.path.join(self.images_path, "template board.png")
+                self.fonts_path = os.path.join(self.assets_path, "fonts")
+                self.output_path = "output_schedule.png"
+                self.custom_output_name = None
+
+                if HOUSES:
+                        self.houses = HOUSES
+                else:
+                        self.houses = {
+                                'A': ['Cloverdale Park', 'Freeman Park', 'Junett', 'Melrose Place', 'Nevaeh II', 'Vanaheim'],
+                                'B': ['Adams', 'Allenmore', 'Garden', 'Morton', 'Tacoma Narrows', 'Voyager']
+                        }
+                self.all_houses = self.houses['A'] + self.houses['B']
+
+                if TREATMENT_LOCATIONS:
+                        self.treatment_locations = TREATMENT_LOCATIONS
+                else:
+                        self.treatment_locations = {
+                                "Al'Ta": {'week': 1, 'weekday': 1, 'time': '18:30', 'address': '1712 6th Ave, Tacoma, WA 98405'},
+                                'Sea-Mar': {'week': 2, 'weekday': 4, 'time': '14:00', 'address': '1415 Center St, Tacoma, WA 98409'},
+                                'Royal Life': {'week': 3, 'weekday': 2, 'time': '20:00', 'address': '1723 Bonney Ave, Sumner, WA 98390'},
+                                'The Tacoma Project': {'week': 4, 'weekday': 3, 'time': '19:00', 'address': '922 S. J St, Tacoma, WA 98405'}
+                        }
+
+                if RULES:
+                        self.rules = RULES
+                else:
+                        self.rules = {
+                                'week_buffer_days': 7,
+                                'treatment_repeat_months': 2,
+                                'inspection_repeat_months': 3,
+                                'houses_per_treatment': 3,
+                                'inspectors_per_inspection': 2
+                        }
+
+                self.history_data = self._load_history()
+                self._parse_history()
+                self._init_fonts()
+
+        def _debug(self, msg):
+                if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug(msg)
+
+        def _init_fonts(self):
+                try:
+                        self.title_font = ImageFont.truetype(os.path.join(self.fonts_path, "Cinzel-Bold.ttf"), 36)
+                        self.text_font = ImageFont.truetype(os.path.join(self.fonts_path, "OpenSans-Bold.ttf"), 22)
+                        self.bullet_font = ImageFont.truetype(os.path.join(self.fonts_path, "OpenSans-Bold.ttf"), 22)
+                        self.plaque_font = ImageFont.truetype(os.path.join(self.fonts_path, "Cinzel-Bold.ttf"), 44)
+                        self.date_font2 = ImageFont.truetype(os.path.join(self.fonts_path, "OpenSans-Bold.ttf"), 19)
+                        self.small_bullet_font = ImageFont.truetype(os.path.join(self.fonts_path, "OpenSans-Bold.ttf"), 18)
+                except:
+                        self.logger.warning("Custom fonts not found. Attempting to use Arial fallback.")
+                        try:
+                                self.title_font = ImageFont.truetype("arial.ttf", 36)
+                                self.text_font = ImageFont.truetype("arial.ttf", 22)
+                                self.bullet_font = ImageFont.truetype("arial.ttf", 22)
+                                self.plaque_font = ImageFont.truetype("arial.ttf", 44)
+                                self.date_font2 = ImageFont.truetype("arial.ttf", 19)
+                                self.small_bullet_font = ImageFont.truetype("arial.ttf", 18)
+                        except:
+                                self.logger.warning("Arial fallback failed. Using tiny default PIL font.")
+                                self.title_font = ImageFont.load_default()
+                                self.text_font = ImageFont.load_default()
+                                self.bullet_font = ImageFont.load_default()
+                                self.plaque_font = ImageFont.load_default()
+                                self.date_font2 = ImageFont.load_default()
+                                self.small_bullet_font = ImageFont.load_default()
+
+        def _load_history(self) -> Dict:
+                if os.path.exists(self.history_file):
+                        try:
+                                with open(self.history_file, 'r', encoding='utf-8-sig') as f:
+                                        return json.load(f)
+                        except:
+                                return self._create_empty_history()
+                return self._create_empty_history()
+
+        def _create_empty_history(self) -> Dict:
+                return {"schedules": [], "metadata": {"last_updated": datetime.now().isoformat(), "version": "1.0", "total_months": 0}}
+
+        def _backup_file(self, file_path: str, reason: str = "auto"):
+                if not os.path.exists(self.backup_dir): os.makedirs(self.backup_dir)
+                backup_path = os.path.join(self.backup_dir, f"history_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{reason}.json")
+                shutil.copy2(file_path, backup_path)
+                return backup_path
+
+        def _parse_history(self):
+                self.parsed_history = {'inspections': [], 'treatments': []}
+                self.months_in_history = set()
+                for schedule in self.history_data.get('schedules', []):
+                        month_year = schedule.get('month_year', '')
+                        try:
+                                month_date = datetime.strptime(month_year, '%B %Y')
+                                self.months_in_history.add(month_date.strftime('%Y-%m'))
+                        except: continue
+
+                        if schedule['type'] == 'house_inspections':
+                                self._parse_inspections(schedule, month_date)
+                        elif schedule['type'] == 'treatment_commitments':
+                                self._parse_treatments(schedule, month_date)
+
+                self.inspection_history = self._build_inspection_history()
+                self.treatment_history = self._build_treatment_history()
+
+        def _parse_inspections(self, schedule, month_date):
+                for event in schedule['events']:
+                        date_str = self._clean_datetime_string(event['datetime_string'])
+                        try:
+                                event_date = datetime.strptime(f"{date_str} {month_date.year}", '%a, %B %d %I:%M %p %Y')
+                        except: continue
+                        for inspector in event['assigned_groups']:
+                                self.parsed_history['inspections'].append({'inspector': inspector, 'target': event['host_location'], 'datetime': event_date})
+
+        def _parse_treatments(self, schedule, month_date):
+                for event in schedule['events']:
+                        date_str = self._clean_datetime_string(event['datetime_string'])
+                        try:
+                                event_date = datetime.strptime(f"{date_str} {month_date.year}", '%a, %b %d %I:%M %p %Y')
+                        except: continue
+                        for house in event['assigned_groups']:
+                                self.parsed_history['treatments'].append({'house': house, 'location': event['organization'], 'datetime': event_date})
+
+        def _clean_datetime_string(self, datetime_str: str) -> str:
+                for suffix in ['st', 'nd', 'rd', 'th']: datetime_str = datetime_str.replace(suffix, '')
+                return datetime_str.replace('@', '').strip()
+
+        def _build_inspection_history(self):
+                history = defaultdict(lambda: defaultdict(list))
+                for insp in self.parsed_history['inspections']:
+                        if insp['inspector'] != insp['target']:
+                                history[insp['inspector']][insp['target']].append(insp['datetime'])
+                return history
+
+        def _build_treatment_history(self):
+                history = defaultdict(lambda: defaultdict(list))
+                for treat in self.parsed_history['treatments']:
+                        history[treat['house']][treat['location']].append(treat['datetime'])
+                return history
+
+        def get_month_calendar(self, year: int, month: int) -> Dict:
+                cal = {}
+                first_day = datetime(year, month, 1)
+                for loc_name, loc_info in self.treatment_locations.items():
+                        date = first_day
+                        while date.month == month:
+                                if date.weekday() == loc_info['weekday'] and (date.day - 1) // 7 + 1 == loc_info['week']:
+                                        time_obj = datetime.strptime(loc_info['time'], '%H:%M').time()
+                                        full_datetime = datetime.combine(date, time_obj)
+                                        cal[loc_name] = full_datetime
+                                        break
+                                date += timedelta(days=1)
+                return cal
+
+        def check_treatment_repeat(self, house, location, date):
+                if house not in self.treatment_history or location not in self.treatment_history[house]: return True
+                for past_date in self.treatment_history[house][location]:
+                        if (date.year - past_date.year) * 12 + (date.month - past_date.month) < 2: return False
+                return True
+
+        def check_inspection_repeat(self, inspector, target, date):
+                if inspector not in self.inspection_history or target not in self.inspection_history[inspector]: return True
+                for past_date in self.inspection_history[inspector][target]:
+                        if (date.year - past_date.year) * 12 + (date.month - past_date.month) < 3: return False
+                return True
+
+        def _month_exists(self, year, month):
+                month_key = f"{year}-{month:02d}"
+                for schedule in self.history_data.get('schedules', []):
+                        try:
+                                if datetime.strptime(schedule.get('month_year', ''), '%B %Y').strftime('%Y-%m') == month_key: return True
+                        except: continue
+                return False
+
+        def _add_to_history(self, schedule, year, month, overwrite=False):
+                if self._month_exists(year, month):
+                        if overwrite: self._remove_month_schedule(year, month)
+                        else: raise ValueError(f"Schedule for {datetime(year, month, 1).strftime('%B %Y')} already exists.")
+
+                treatment_entry = {"title": f"🏥 TREATMENT COMMITMENTS: {schedule['month_year']}", "type": "treatment_commitments", "month_year": schedule['month_year'], "events": []}
+                for t in schedule['treatment_commitments']:
+                        treatment_entry['events'].append({"organization": t['organization'], "datetime_string": t['datetime_string'], "address": t['address'], "assigned_groups": t['assigned_houses']})
+
+                inspection_entry = {"title": f"🏠 HOUSE INSPECTIONS: {schedule['month_year']}", "type": "house_inspections", "month_year": schedule['month_year'], "events": []}
+                for i in schedule['house_inspections']:
+                        inspection_entry['events'].append({"host_location": i['host_location'], "datetime_string": i['datetime_string'], "assigned_groups": i['inspecting_houses']})
+
+                self.history_data['schedules'].extend([treatment_entry, inspection_entry])
+                self.history_data['metadata']['last_updated'] = datetime.now().isoformat()
+                self.history_data['metadata']['total_months'] = len(self.months_in_history) + 1
+                self._save_history()
+                self._parse_history()
+
+        def _remove_month_schedule(self, year, month):
+                month_key = f"{year}-{month:02d}"
+                self.history_data['schedules'] = [
+                        s for s in self.history_data['schedules']
+                        if datetime.strptime(s.get('month_year', '').upper(), '%B %Y').strftime('%Y-%m') != month_key
+                ]
+
+        def _save_history(self):
+                if os.path.exists(self.history_file): self._backup_file(self.history_file, "pre_save")
+                with open(self.history_file, 'w', encoding='utf-8') as f: json.dump(self.history_data, f, indent=2, default=str)
+
+        def get_inspection_dates(self, year, month):
+                return [datetime(year, month, d, 17, 0) for d in range(1, calendar.monthrange(year, month)[1] + 1)]
+
+        def schedule_treatments(self, year, month):
+                cal = self.get_month_calendar(year, month)
+                treatment_schedule, assigned_houses = {}, set()
+
+                for loc_name, loc_date in cal.items():
+                        assigned = []
+
+                        # Calculate the priority score for each house for THIS location
+                        eligible = []
+                        for house in self.all_houses:
+                                if house in assigned_houses:
+                                        continue
+
+                                # Get last time this house attended this specific treatment center
+                                last_commit = None
+                                if house in self.treatment_history and loc_name in self.treatment_history[house]:
+                                        last_commit = max(self.treatment_history[house][loc_name])
+
+                                # Compute days since last attendance (or infinity if never)
+                                if last_commit:
+                                        days_since = (loc_date - last_commit).days
+                                else:
+                                        days_since = 99999  # Highest priority if never attended
+
+                                eligible.append((house, days_since))
+
+                        # Sort by longest wait time (largest days_since first)
+                        eligible.sort(key=lambda x: x[1], reverse=True)
+
+                        # Pick the top 3 (or as many as possible)
+                        for house, _ in eligible:
+                                if len(assigned) >= 3:
+                                        break
+                                assigned.append(house)
+                                assigned_houses.add(house)
+
+                        # If we couldn't fill 3, take any remaining houses (shouldn't happen with 12 houses)
+                        if len(assigned) < 3:
+                                remaining = [h for h in self.all_houses if h not in assigned_houses]
+                                for h in remaining:
+                                        if len(assigned) >= 3:
+                                                break
+                                        assigned.append(h)
+                                        assigned_houses.add(h)
+
+                        treatment_schedule[loc_name] = {'date': loc_date, 'houses': assigned}
+
+                return treatment_schedule
+
+        # ← THIS NEEDS TO BE INDENTED INSIDE THE CLASS
+        def schedule_inspections(self, year, month, group, treatment_schedule):
+        inspection_targets = self.houses[group]
+        inspectors = [h for h in self.all_houses if h not in inspection_targets]
+        available_dates = self.get_inspection_dates(year, month)
+
+        commitment_dates_by_house = defaultdict(list)
+        for loc_name, info in treatment_schedule.items():
+                for house in info['houses']:
+                        commitment_dates_by_house[house].append(info['date'])
+
+        inspection_schedule, violations = {}, []
+        used_dates = set()
+        inspector_usage = defaultdict(int)
+        used_inspectors_per_date = defaultdict(set)
+        inspector_used_dates = defaultdict(set)
+
+        # RULE: Max 2 inspections per inspector per month (fair distribution)
+        MAX_INSPECTIONS_PER_INSPECTOR = 2
+
+        # RULE: Minimum 4 days between inspections for the SAME inspector
+        MIN_DAYS_BETWEEN = self.rules['week_buffer_days']
+
+        # RULE: 3 months between same inspector inspecting same target
+        INSPECTION_REPEAT_MONTHS = self.rules['inspection_repeat_months']
+
+        # Sort targets by priority (those with longest wait since last inspection)
+        targets_with_priority = []
+        for target in inspection_targets:
+                # Find when this target was last inspected by ANYONE
+                last_inspection = None
+                for inspector in inspectors:
+                        if inspector in self.inspection_history and target in self.inspection_history[inspector]:
+                                last = max(self.inspection_history[inspector][target])
+                                if last_inspection is None or last > last_inspection:
+                                        last_inspection = last
+
+                if last_inspection:
+                        days_since = (datetime(year, month, 1) - last_inspection).days
+                else:
+                        days_since = 99999  # Never inspected - highest priority
+
+                targets_with_priority.append((target, days_since))
+
+        # Sort by longest wait first (most in need)
+        targets_with_priority.sort(key=lambda x: x[1], reverse=True)
+        sorted_targets = [t[0] for t in targets_with_priority]
+
+        for target in sorted_targets:
+                best_pair = None
+                best_date = None
+                best_score = float('inf')
+
+                # Try each available date
+                for date in available_dates:
+                        # RULE: Check week_buffer_days between inspection dates
+                        if date in used_dates:
+                                continue
+
+                        # Check if any inspector already has an inspection too close
+                        too_close = False
+                        for inspector in inspectors:
+                                for used_date in inspector_used_dates[inspector]:
+                                        if abs((date - used_date).days) < MIN_DAYS_BETWEEN:
+                                                too_close = True
+                                                break
+                                if too_close:
+                                        break
+                        if too_close:
+                                continue
+
+                        # Find eligible inspectors for this date
+                        eligible = []
+                        for inspector in inspectors:
+                                # RULE: Max inspections per inspector
+                                if inspector_usage[inspector] >= MAX_INSPECTIONS_PER_INSPECTOR:
+                                        continue
+
+                                # Can't inspect twice on same day
+                                if date in used_inspectors_per_date[date]:
+                                        continue
+
+                                # Can't inspect if they have a treatment commitment
+                                if any(abs((date - td).days) == 0 for td in commitment_dates_by_house[inspector]):
+                                        continue
+
+                                # RULE: 3 months between same inspector-target pair
+                                if inspector in self.inspection_history and target in self.inspection_history[inspector]:
+                                        last = max(self.inspection_history[inspector][target])
+                                        months_since = (date.year - last.year) * 12 + (date.month - last.month)
+                                        if months_since < INSPECTION_REPEAT_MONTHS:
+                                                continue
+
+                                # Calculate score: lower usage = better
+                                score = inspector_usage[inspector]
+                                eligible.append((inspector, score))
+
+                        # Sort by usage (lowest first)
+                        eligible.sort(key=lambda x: x[1])
+
+                        # Try to pair inspectors
+                        for i in range(len(eligible)):
+                                for j in range(i+1, len(eligible)):
+                                        inspector_a = eligible[i][0]
+                                        inspector_b = eligible[j][0]
+
+                                        # Check if these two inspectors can work together
+                                        # Don't pair if both have commitments on same day
+                                        has_a_commit = any(abs((date - td).days) < 2 for td in commitment_dates_by_house[inspector_a])
+                                        has_b_commit = any(abs((date - td).days) < 2 for td in commitment_dates_by_house[inspector_b])
+
+                                        if has_a_commit and has_b_commit:
+                                                continue
+
+                                        total_score = eligible[i][1] + eligible[j][1]
+                                        if total_score < best_score:
+                                                best_score = total_score
+                                                best_pair = (inspector_a, inspector_b)
+                                                best_date = date
+
+                if best_pair:
+                        inspection_schedule[target] = {
+                                'date': best_date,
+                                'inspectors': list(best_pair)
+                        }
+
+                        for insp in best_pair:
+                                inspector_usage[insp] += 1
+                                used_inspectors_per_date[best_date].add(insp)
+                                inspector_used_dates[insp].add(best_date)
+
+                        used_dates.add(best_date)
+                else:
+                        # Fallback: schedule anyway but mark as violation
+                        violations.append(f"Could not properly schedule inspectors for {target}")
+
+                        # Find any available date
+                        fallback_date = None
+                        for d in available_dates:
+                                if d not in used_dates:
+                                        fallback_date = d
+                                        break
+                        if not fallback_date:
+                                fallback_date = available_dates[0]
+
+                        # Find any available inspectors
+                        fallback_inspectors = []
+                        for insp in inspectors:
+                                if insp not in used_inspectors_per_date[fallback_date]:
+                                        if inspector_usage[insp] < MAX_INSPECTIONS_PER_INSPECTOR:
+                                                fallback_inspectors.append(insp)
+                                                if len(fallback_inspectors) >= 2:
+                                                        break
+
+                        if len(fallback_inspectors) < 2:
+                                # Last resort: use any inspectors
+                                for insp in inspectors:
+                                        if insp not in used_inspectors_per_date[fallback_date]:
+                                                fallback_inspectors.append(insp)
+                                                if len(fallback_inspectors) >= 2:
+                                                        break
+                                if len(fallback_inspectors) < 2:
+                                        fallback_inspectors = inspectors[:2]
+
+                        inspection_schedule[target] = {
+                                'date': fallback_date,
+                                'inspectors': fallback_inspectors,
+                                'violation': True
+                        }
+
+                        for insp in fallback_inspectors:
+                                inspector_usage[insp] += 1
+                                used_inspectors_per_date[fallback_date].add(insp)
+                                inspector_used_dates[insp].add(fallback_date)
+
+                        used_dates.add(fallback_date)
+
+        return inspection_schedule, violations
+
+        def generate_schedule(self, year, month, overwrite=False, auto_save=True):
+                group = 'A' if month % 2 == 1 else 'B'
+                treatment_schedule = self.schedule_treatments(year, month)
+                inspection_schedule, violations = self.schedule_inspections(year, month, group, treatment_schedule)
+
+                output = {'month_year': datetime(year, month, 1).strftime('%B %Y'), 'inspected_group': group, 'treatment_commitments': [], 'house_inspections': [], 'violations': violations, 'auto_saved': False, 'overwritten': False}
+                for loc_name, info in treatment_schedule.items():
+                        loc_info = self.treatment_locations[loc_name]
+                        output['treatment_commitments'].append({'organization': loc_name, 'datetime_string': info['date'].strftime('%a, %b %d @ %I:%M %p').lstrip('0'), 'address': loc_info['address'], 'assigned_houses': info['houses']})
+                for target, info in inspection_schedule.items():
+                        output['house_inspections'].append({'host_location': target, 'datetime_string': info['date'].strftime('%a, %B %d @ %I:%M %p').lstrip('0'), 'inspecting_houses': info['inspectors'], 'violation': info.get('violation', False)})
+
+                if auto_save:
+                        self._add_to_history(output, year, month, overwrite)
+                        output['auto_saved'] = True; output['overwritten'] = overwrite
+                return output
+
+        def set_output_name(self, name):
+                self.custom_output_name = name
+                return self
+
+        def generate_infograph(self, inspection_data, treatment_data, month_year):
+                try:
+                        canvas = Image.open(self.template_path).convert("RGBA")
+                        draw = ImageDraw.Draw(canvas)
+                except FileNotFoundError:
+                        self.logger.error(f"Template not found at {self.template_path}")
+                        raise
+
+                def draw_with_outline(draw, text, x, y, font, anchor="la"):
+                        offsets = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
+                        for ox, oy in offsets:
+                                draw.text((x + ox, y + oy), text, font=font, fill="#FFFFFF", anchor=anchor)
+                        draw.text((x, y), text, font=font, fill="#000000", anchor=anchor)
+
+                FRAME_W = 308
+                FRAME_H = 187
+                INNER_W = 281
+                INNER_H = 127
+
+                frame_centers = [
+                        (205, 254), (521, 254),
+                        (205, 452), (521, 452),
+                        (205, 650), (521, 650)
+                ]
+
+                ROW_W = 590
+                ROW_H = 123
+
+                row_centers = [
+                        (1055, 223), (1055, 367), (1055, 511), (1055, 655)
+                ]
+
+                for i, inspection in enumerate(inspection_data[:6]):
+                        if i >= len(frame_centers): break
+                        house_name = inspection['host_location']
+                        date_time = inspection['datetime_string']
+                        inspectors = inspection['inspecting_houses']
+
+                        art_path = os.path.join(self.images_path, f"{house_name.lower()} art.png")
+                        frame_path = os.path.join(self.images_path, "frame.png")
+
+                        cx, cy = frame_centers[i]
+                        x = cx - (FRAME_W // 2)
+                        y = cy - (FRAME_H // 2)
+
+                        try:
+                                frame_img = Image.open(frame_path).convert("RGBA")
+                                frame_img = frame_img.resize((FRAME_W, FRAME_H), Image.Resampling.LANCZOS)
+                                art_img = Image.open(art_path).convert("RGBA")
+                                art_img = art_img.resize((INNER_W, INNER_H), Image.Resampling.LANCZOS)
+                                inner_x = cx - (INNER_W // 2)
+                                inner_y = cy - (INNER_H // 2)
+                                canvas.paste(art_img, (inner_x, inner_y), art_img)
+                                canvas.paste(frame_img, (x, y), frame_img)
+                        except Exception as e:
+                                try:
+                                        blank_frame = Image.open(os.path.join(self.images_path, "blank frame.png")).convert("RGBA")
+                                        canvas.paste(blank_frame, (x, y), blank_frame)
+                                except:
+                                        pass
+                                self.logger.warning(f"Asset error for {house_name}: {e}")
+
+                        if " @ " in date_time:
+                                date_part, time_part = date_time.split(" @ ")
+                                time_part = "@ " + time_part
+                        else:
+                                date_part = date_time
+                                time_part = ""
+
+                        draw_with_outline(draw, date_part, x + 30, y + 55, self.date_font2)
+                        draw_with_outline(draw, time_part, x + 30, y + 75, self.text_font)
+
+                        base_max_y = y + 145
+                        extra_shift = 10 if i >= 4 else 0
+                        max_y = base_max_y - extra_shift
+                        current_y = max_y - 5
+
+                        for inspector in inspectors:
+                                draw_with_outline(draw, f"• {inspector}", x + 28, current_y, self.small_bullet_font)
+                                current_y -= 28
+
+                badge_map = {
+                        "Al'Ta": "alta badge.png",
+                        "Sea-Mar": "seamar badge.png",
+                        "Royal Life": "royal life badge.png",
+                        "The Tacoma Project": "the tacoma project badge.png"
+                }
+
+                for i, treatment in enumerate(treatment_data[:4]):
+                        if i >= len(row_centers): break
+                        org_name = treatment['organization']
+                        date_time = treatment['datetime_string']
+                        address = treatment['address']
+                        houses = treatment['assigned_houses']
+
+                        badge_path = os.path.join(self.images_path, badge_map.get(org_name, "default_badge.png"))
+                        try:
+                                badge_art = Image.open(badge_path).convert("RGBA")
+                                badge_art = badge_art.resize((ROW_W, ROW_H), Image.Resampling.LANCZOS)
+                        except:
+                                try:
+                                        blank_badge = Image.open(os.path.join(self.images_path, "blank badge.png")).convert("RGBA")
+                                        blank_badge = blank_badge.resize((ROW_W, ROW_H), Image.Resampling.LANCZOS)
+                                        badge_art = blank_badge
+                                except:
+                                        self.logger.warning(f"Badge not found for {org_name}")
+                                        continue
+
+                        cx, cy = row_centers[i]
+                        bx = cx - (ROW_W // 2)
+                        by = cy - (ROW_H // 2)
+                        canvas.paste(badge_art, (bx, by), badge_art)
+
+                        draw_with_outline(draw, org_name, bx + 20, by - 10, self.title_font)
+
+                        RIGHT_EDGE_X = bx + ROW_W - 10
+
+                        parts = address.split(',')
+                        if len(parts) >= 2:
+                                address_line1 = parts[0].strip()
+                                address_line2 = ", ".join(p.strip() for p in parts[1:])
+                        else:
+                                address_line1 = address
+                                address_line2 = ""
+
+                        right_info_lines = [
+                                address_line2,
+                                address_line1,
+                                date_time
+                        ]
+
+                        start_y = by + 90
+                        gap = 20
+
+                        for i, line in enumerate(right_info_lines):
+                                draw_with_outline(draw, line, RIGHT_EDGE_X, start_y - (i * gap), self.text_font, anchor="ra")
+
+                        current_y = by + 90
+                        for h in houses:
+                                draw_with_outline(draw, f"• {h}", bx + 10, current_y, self.bullet_font)
+                                current_y -= 25
+
+                if self.custom_output_name:
+                        save_path = self.custom_output_name
+                        self.custom_output_name = None
+                else:
+                        save_path = self.output_path
+
+                canvas.save(save_path)
+                self.logger.info(f"Infographic saved to {save_path}")
+                return save_path
+
+        def generate_full_schedule(self, year, month, overwrite=False):
+                schedule = self.generate_schedule(year, month, overwrite, auto_save=True)
+                return schedule, self.generate_infograph(schedule['house_inspections'], schedule['treatment_commitments'], schedule['month_year'])
+
+        def get_schedule_for_month(self, year, month):
+                month_key = f"{year}-{month:02d}"
+                for schedule in self.history_data.get('schedules', []):
+                        try:
+                                if datetime.strptime(schedule.get('month_year', ''), '%B %Y').strftime('%Y-%m') == month_key: return schedule
+                        except: continue
+                return None
+
+        def get_all_schedules(self): return self.history_data.get('schedules', [])
+
+        def get_statistics(self):
+                violations = 0
+                for schedule in self.history_data.get('schedules', []):
+                        if schedule.get('type') == 'house_inspections':
+                                violations += sum(1 for e in schedule.get('events', []) if e.get('violation', False))
+                return {'total_months_scheduled': len(self.months_in_history), 'total_inspections': len(self.parsed_history['inspections']), 'total_treatments': len(self.parsed_history['treatments']), 'total_violations': violations, 'last_updated': self.history_data['metadata'].get('last_updated', 'Never')}
